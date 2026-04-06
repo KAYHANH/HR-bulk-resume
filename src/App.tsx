@@ -35,7 +35,7 @@ type ResumeInput = {
   id: string;
   name: string;
   content: string;
-  status: 'parsing' | 'idle' | 'processing' | 'success' | 'error';
+  status: 'queued' | 'parsing' | 'idle' | 'processing' | 'success' | 'error';
   result?: ATSResult;
   error?: string;
   file?: File;
@@ -57,6 +57,7 @@ type AnalyzeBatchResult = ATSResult & {
 };
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const FILE_PARSE_CONCURRENCY = 3;
 
 const parseFile = async (file: File): Promise<string> => {
   let text = '';
@@ -69,7 +70,9 @@ const parseFile = async (file: File): Promise<string> => {
       const page = await pdf.getPage(i);
       const content = await page.getTextContent();
       text += content.items.map((item: any) => item.str).join(' ') + '\n';
+      page.cleanup();
     }
+    pdf.cleanup();
   } else if (file.name.endsWith('.docx') || file.name.endsWith('.doc') || file.type.includes('word')) {
     const arrayBuffer = await file.arrayBuffer();
     const result = await mammoth.extractRawText({ arrayBuffer });
@@ -124,6 +127,9 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jdFileInputRef = useRef<HTMLInputElement>(null);
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
+  const queuedResumeCount = resumes.filter(r => r.status === 'queued').length;
+  const parsingResumeCount = resumes.filter(r => r.status === 'parsing').length;
+  const isFileParsing = queuedResumeCount > 0 || parsingResumeCount > 0;
 
   useEffect(() => {
     loadSessions();
@@ -164,7 +170,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (view === 'editor' && currentSessionId) {
+    if (view === 'editor' && currentSessionId && !resumes.some(r => r.status === 'queued' || r.status === 'parsing' || r.status === 'processing')) {
       const timeout = setTimeout(() => {
         saveCurrentSession(jobDescription, resumes, sessionName);
       }, 1000);
@@ -237,7 +243,7 @@ export default function App() {
         id: Math.random().toString(36).substring(7) + Date.now().toString(36),
         name: file.name.replace(/\.[^/.]+$/, ""),
         content: '',
-        status: 'parsing',
+        status: 'queued',
         file: file
       }));
       
@@ -249,15 +255,33 @@ export default function App() {
   };
 
   const processFiles = async (newResumes: ResumeInput[]) => {
-    for (const item of newResumes) {
-      try {
-        const text = await parseFile(item.file!);
-        setResumes(prev => prev.map(r => r.id === item.id ? { ...r, content: text, status: 'idle' } : r));
-      } catch (err) {
-        console.error(`Error reading file ${item.name}:`, err);
-        setResumes(prev => prev.map(r => r.id === item.id ? { ...r, status: 'error', error: err instanceof Error ? err.message : 'Failed to parse file' } : r));
+    const queue = [...newResumes];
+
+    const processNext = async () => {
+      while (queue.length > 0) {
+        const item = queue.shift();
+        if (!item) {
+          return;
+        }
+
+        setResumes(prev => prev.map(r => r.id === item.id ? { ...r, status: 'parsing', error: undefined } : r));
+
+        try {
+          const text = await parseFile(item.file!);
+          setResumes(prev => prev.map(r => r.id === item.id ? { ...r, content: text, status: 'idle' } : r));
+        } catch (err) {
+          console.error(`Error reading file ${item.name}:`, err);
+          setResumes(prev => prev.map(r => r.id === item.id ? { ...r, status: 'error', error: err instanceof Error ? err.message : 'Failed to parse file' } : r));
+        }
       }
-    }
+    };
+
+    await Promise.all(
+      Array.from(
+        { length: Math.min(FILE_PARSE_CONCURRENCY, newResumes.length) },
+        () => processNext(),
+      ),
+    );
   };
 
   const addManualResume = () => {
@@ -286,7 +310,7 @@ export default function App() {
       alert("Please add at least one resume.");
       return;
     }
-    if (resumes.some(r => r.status === 'parsing')) {
+    if (resumes.some(r => r.status === 'queued' || r.status === 'parsing')) {
       alert("Please wait for all files to finish parsing.");
       return;
     }
@@ -294,7 +318,7 @@ export default function App() {
     setIsProcessing(true);
     
     const pendingResumes = resumes.map((r, index) => ({ ...r, originalIndex: index }))
-                                  .filter(r => r.status !== 'parsing' && (reanalyzeAll || r.status !== 'success'));
+                                  .filter(r => r.status !== 'queued' && r.status !== 'parsing' && (reanalyzeAll || r.status !== 'success'));
 
     if (pendingResumes.length === 0) {
       setIsProcessing(false);
@@ -662,7 +686,7 @@ export default function App() {
             </button>
             <button 
               onClick={() => handleAnalyze(true)}
-              disabled={isProcessing || !hasCompletedAnalysis || !jobDescription.trim() || resumes.some(r => r.status === 'parsing')}
+              disabled={isProcessing || !hasCompletedAnalysis || !jobDescription.trim() || isFileParsing}
               className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
               {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
@@ -670,7 +694,7 @@ export default function App() {
             </button>
             <button 
               onClick={handleAnalyze}
-              disabled={isProcessing || resumes.length === 0 || !jobDescription.trim() || resumes.some(r => r.status === 'parsing')}
+              disabled={isProcessing || resumes.length === 0 || !jobDescription.trim() || isFileParsing}
               className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed shadow-sm transition-colors"
             >
               {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
@@ -730,7 +754,13 @@ export default function App() {
                   <Plus className="w-4 h-4" /> Add Manual
                 </button>
               </div>
-              <div className="p-4 space-y-4">
+                <div className="p-4 space-y-4">
+                {isFileParsing && (
+                  <div className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-700">
+                    Parsing resumes: {parsingResumeCount} active
+                    {queuedResumeCount > 0 ? `, ${queuedResumeCount} queued` : ''}.
+                  </div>
+                )}
                 {/* Upload Zone */}
                 <div 
                   className="border-2 border-dashed border-slate-300 rounded-lg p-6 text-center hover:bg-slate-50 transition-colors cursor-pointer"
@@ -855,6 +885,7 @@ function ResumeItem({ resume, updateResume, removeResume }: {
           />
         </div>
         <div className="flex items-center gap-3 shrink-0 ml-4">
+          {resume.status === 'queued' && <Clock className="w-4 h-4 text-slate-400" title="Queued for parsing" />}
           {resume.status === 'parsing' && <Loader2 className="w-4 h-4 animate-spin text-slate-400" title="Parsing file..." />}
           {resume.status === 'processing' && <Loader2 className="w-4 h-4 animate-spin text-blue-500" />}
           {resume.status === 'success' && <CheckCircle className="w-4 h-4 text-green-500" />}
@@ -877,9 +908,9 @@ function ResumeItem({ resume, updateResume, removeResume }: {
           <textarea 
             value={resume.content}
             onChange={(e) => updateResume(resume.id, { content: e.target.value })}
-            disabled={resume.status === 'parsing'}
+            disabled={resume.status === 'queued' || resume.status === 'parsing'}
             className="w-full h-32 text-sm p-3 border border-slate-200 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none resize-none bg-white disabled:opacity-50"
-            placeholder={resume.status === 'parsing' ? "Extracting text..." : "Paste resume content here..."}
+            placeholder={resume.status === 'queued' ? "Waiting to start parsing..." : resume.status === 'parsing' ? "Extracting text..." : "Paste resume content here..."}
           />
         </div>
       )}
@@ -940,6 +971,7 @@ function ResultRow({ resume, index, getScoreColor, getScoreTextColor, getRankBad
           )}
         </td>
         <td className="p-4 text-center">
+          {resume.status === 'queued' && <span className="text-xs font-medium text-slate-500 bg-slate-100 px-2 py-1 rounded-full inline-flex items-center gap-1"><Clock className="w-3 h-3"/> Queued</span>}
           {resume.status === 'parsing' && <span className="text-xs font-medium text-slate-500 bg-slate-100 px-2 py-1 rounded-full inline-flex items-center gap-1"><Loader2 className="w-3 h-3 animate-spin"/> Parsing</span>}
           {resume.status === 'idle' && <span className="text-xs font-medium text-slate-500 bg-slate-100 px-2 py-1 rounded-full">Pending</span>}
           {resume.status === 'processing' && <span className="text-xs font-medium text-blue-600 bg-blue-50 px-2 py-1 rounded-full inline-flex items-center gap-1"><Loader2 className="w-3 h-3 animate-spin"/> Processing</span>}
