@@ -1,18 +1,24 @@
 
+# Bulk ATS Resume Checker
 
-# Run and deploy your AI Studio app
-
-This contains everything you need to run your app locally.
-
-View your app in AI Studio: https://ai.studio/apps/c8a56122-15a7-4b4a-ac78-31a2c55b23d3
+Analyze and rank multiple resumes against a job description using Gemini AI.
 
 ## Run Locally
 
-**Prerequisites:**  Node.js
-
+**Prerequisites:** Node.js 20+
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
+2. Create `.env.local` and add your Gemini key:
+   `GEMINI_API_KEY="YOUR_GEMINI_API_KEY"`
+3. Start the app:
    `npm run dev`
+
+`npm run dev` now starts a single Express server that serves the React app and handles Gemini requests on `/api/analyze`, so the API key stays on the server instead of in the browser bundle.
+
+## Production Preview
+
+1. Build the app:
+   `npm run build`
+2. Start the production server:
+   `npm run preview`

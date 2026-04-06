@@ -1,5 +1,4 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { GoogleGenAI, Type } from '@google/genai';
+import React, { useState, useRef, useEffect } from 'react';
 import { UploadCloud, Plus, Trash2, ChevronDown, ChevronUp, Play, Download, CheckCircle, XCircle, AlertCircle, FileText, Award, Loader2, Briefcase, Users, BarChart3, Upload, ArrowLeft, Clock } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -37,6 +36,10 @@ type SessionData = SessionMeta & {
   resumes: ResumeInput[];
 };
 
+type AnalyzeBatchResult = ATSResult & {
+  id: string;
+};
+
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const parseFile = async (file: File): Promise<string> => {
@@ -59,6 +62,36 @@ const parseFile = async (file: File): Promise<string> => {
     throw new Error('Unsupported file type');
   }
   return text;
+};
+
+const analyzeResumeBatch = async (
+  jobDescription: string,
+  resumes: Array<Pick<ResumeInput, 'id' | 'content'>>
+): Promise<AnalyzeBatchResult[]> => {
+  const response = await fetch('/api/analyze', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ jobDescription, resumes }),
+  });
+
+  let payload: { results?: AnalyzeBatchResult[]; error?: string } | null = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+
+  if (!response.ok) {
+    throw new Error(payload?.error || `Request failed with status ${response.status}.`);
+  }
+
+  if (!payload?.results || !Array.isArray(payload.results)) {
+    throw new Error('Analysis service returned an invalid response.');
+  }
+
+  return payload.results;
 };
 
 export default function App() {
@@ -232,7 +265,6 @@ export default function App() {
     }
     
     setIsProcessing(true);
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
     
     const pendingResumes = resumes.map((r, index) => ({ ...r, originalIndex: index }))
                                   .filter(r => r.status !== 'success' && r.status !== 'parsing');
@@ -272,54 +304,15 @@ export default function App() {
 
         while (retries < 3 && !success) {
           try {
-            const prompt = `Act as an Expert HR Recruiter. Evaluate the following candidate resumes against the job description.
-Make a definitive recommendation: 'Hire', 'Shortlist', or 'Reject'.
-Output JSON only, containing a 'results' array matching the IDs of the provided resumes.
-
-Job Description:
-${jobDescription.substring(0, 5000)}
-
-Resumes to Evaluate:
-${chunk.map(r => `--- RESUME ID: ${r.id} ---\n${r.content.substring(0, 4000)}\n`).join('\n')}
-`;
-
-            const response = await ai.models.generateContent({
-              model: 'gemini-3.1-flash-lite-preview',
-              contents: prompt,
-              config: {
-                responseMimeType: 'application/json',
-                responseSchema: {
-                  type: Type.OBJECT,
-                  properties: {
-                    results: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          id: { type: Type.STRING, description: "The RESUME ID provided in the prompt." },
-                          score: { type: Type.INTEGER, description: "The ATS match score from 0 to 100." },
-                          recommendation: { type: Type.STRING, enum: ['Hire', 'Shortlist', 'Reject'] },
-                          reasoning: { type: Type.STRING },
-                          foundKeywords: { type: Type.ARRAY, items: { type: Type.STRING } },
-                          missingKeywords: { type: Type.ARRAY, items: { type: Type.STRING } },
-                        },
-                        required: ["id", "score", "recommendation", "reasoning", "foundKeywords", "missingKeywords"],
-                      }
-                    }
-                  },
-                  required: ["results"],
-                },
-                temperature: 0.2,
-              }
-            });
-            
-            const parsed = JSON.parse(response.text);
-            const batchResults = parsed.results || [];
+            const batchResults = await analyzeResumeBatch(
+              jobDescription,
+              chunk.map(r => ({ id: r.id, content: r.content }))
+            );
             
             setResumes(prev => {
               const next = [...prev];
               chunk.forEach(pr => {
-                const res = batchResults.find((b: any) => b.id === pr.id);
+                const res = batchResults.find(b => b.id === pr.id);
                 if (res) {
                   next[pr.originalIndex] = { ...next[pr.originalIndex], status: 'success', result: res };
                 } else {
@@ -329,9 +322,10 @@ ${chunk.map(r => `--- RESUME ID: ${r.id} ---\n${r.content.substring(0, 4000)}\n`
               return next;
             });
             success = true;
-          } catch (error: any) {
+          } catch (error) {
             console.error("Error analyzing batch:", error);
-            const isRateLimit = error?.message?.toLowerCase().includes('429') || error?.message?.toLowerCase().includes('quota') || error?.status === 429;
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            const isRateLimit = errorMessage.toLowerCase().includes('429') || errorMessage.toLowerCase().includes('quota');
             
             if (isRateLimit) {
               retries++;
@@ -357,7 +351,7 @@ ${chunk.map(r => `--- RESUME ID: ${r.id} ---\n${r.content.substring(0, 4000)}\n`
               setResumes(prev => {
                 const next = [...prev];
                 chunk.forEach(pr => {
-                  next[pr.originalIndex] = { ...next[pr.originalIndex], status: 'error', error: String(error) };
+                  next[pr.originalIndex] = { ...next[pr.originalIndex], status: 'error', error: errorMessage };
                 });
                 return next;
               });
