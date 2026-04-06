@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { UploadCloud, Plus, Trash2, ChevronDown, ChevronUp, Play, Download, CheckCircle, XCircle, AlertCircle, FileText, Award, Loader2, Briefcase, Users, BarChart3, Upload, ArrowLeft, Clock } from 'lucide-react';
+import { UploadCloud, Plus, Trash2, ChevronDown, ChevronUp, Play, Download, CheckCircle, XCircle, AlertCircle, FileText, Award, Loader2, Briefcase, Users, BarChart3, Upload, ArrowLeft, Clock, Pencil } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as pdfjsLib from 'pdfjs-dist';
 import mammoth from 'mammoth';
@@ -12,7 +12,23 @@ type ATSResult = {
   recommendation: 'Hire' | 'Shortlist' | 'Reject';
   reasoning: string;
   foundKeywords: string[];
+  exactMatchedSkills: string[];
+  similarMatchedSkills: string[];
   missingKeywords: string[];
+  contactDetails: {
+    email?: string;
+    phone?: string;
+    linkedin?: string;
+    github?: string;
+    portfolio?: string;
+  };
+  scoreBreakdown: {
+    requiredSkills: number;
+    preferredSkills: number;
+    roleFit: number;
+    experience: number;
+  };
+  yearsExperience: number;
 };
 
 type ResumeInput = {
@@ -99,6 +115,7 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [sessionName, setSessionName] = useState('Untitled Session');
+  const [isEditingSessionName, setIsEditingSessionName] = useState(false);
 
   const [jobDescription, setJobDescription] = useState('');
   const [resumes, setResumes] = useState<ResumeInput[]>([]);
@@ -106,10 +123,18 @@ export default function App() {
   const [sortConfig, setSortConfig] = useState<{ key: 'name' | 'score', direction: 'asc' | 'desc' }>({ key: 'score', direction: 'desc' });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jdFileInputRef = useRef<HTMLInputElement>(null);
+  const sessionNameInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     loadSessions();
   }, []);
+
+  useEffect(() => {
+    if (isEditingSessionName) {
+      sessionNameInputRef.current?.focus();
+      sessionNameInputRef.current?.select();
+    }
+  }, [isEditingSessionName]);
 
   const loadSessions = async () => {
     const allKeys = await keys();
@@ -151,6 +176,7 @@ export default function App() {
     const id = Math.random().toString(36).substring(7) + Date.now().toString(36);
     setCurrentSessionId(id);
     setSessionName('New Session');
+    setIsEditingSessionName(false);
     setJobDescription('');
     setResumes([]);
     setView('editor');
@@ -161,6 +187,7 @@ export default function App() {
     if (data) {
       setCurrentSessionId(data.id);
       setSessionName(data.name);
+      setIsEditingSessionName(false);
       setJobDescription(data.jobDescription);
       setResumes(data.resumes);
       setView('editor');
@@ -250,7 +277,7 @@ export default function App() {
     setResumes(prev => prev.filter(r => r.id !== id));
   };
 
-  const handleAnalyze = async () => {
+  const handleAnalyze = async (reanalyzeAll = false) => {
     if (!jobDescription.trim()) {
       alert("Please enter a job description.");
       return;
@@ -267,18 +294,29 @@ export default function App() {
     setIsProcessing(true);
     
     const pendingResumes = resumes.map((r, index) => ({ ...r, originalIndex: index }))
-                                  .filter(r => r.status !== 'success' && r.status !== 'parsing');
+                                  .filter(r => r.status !== 'parsing' && (reanalyzeAll || r.status !== 'success'));
+
+    if (pendingResumes.length === 0) {
+      setIsProcessing(false);
+      alert(reanalyzeAll ? "No resumes available to re-analyze." : "All resumes are already analyzed.");
+      return;
+    }
     
     setResumes(prev => {
       const next = [...prev];
       pendingResumes.forEach(pr => {
-        next[pr.originalIndex] = { ...next[pr.originalIndex], status: 'processing', error: undefined };
+        next[pr.originalIndex] = {
+          ...next[pr.originalIndex],
+          status: next[pr.originalIndex].status === 'error' || reanalyzeAll ? 'idle' : next[pr.originalIndex].status,
+          error: undefined,
+          result: reanalyzeAll ? undefined : next[pr.originalIndex].result,
+        };
       });
       return next;
     });
 
     const BATCH_SIZE = 5;
-    const CONCURRENCY_LIMIT = 5; // 5 concurrent batches of 5 = 25 resumes at a time
+    const CONCURRENCY_LIMIT = 2; // Faster while still being moderate for free-tier limits
     
     const chunks: typeof pendingResumes[] = [];
     for (let i = 0; i < pendingResumes.length; i += BATCH_SIZE) {
@@ -299,10 +337,22 @@ export default function App() {
         const chunk = chunks[chunkIndex];
         activeCount++;
 
+        setResumes(prev => {
+          const next = [...prev];
+          chunk.forEach(pr => {
+            next[pr.originalIndex] = {
+              ...next[pr.originalIndex],
+              status: 'processing',
+              error: undefined,
+            };
+          });
+          return next;
+        });
+
         let retries = 0;
         let success = false;
 
-        while (retries < 3 && !success) {
+        while (retries < 4 && !success) {
           try {
             const batchResults = await analyzeResumeBatch(
               jobDescription,
@@ -325,24 +375,40 @@ export default function App() {
           } catch (error) {
             console.error("Error analyzing batch:", error);
             const errorMessage = error instanceof Error ? error.message : String(error);
-            const isRateLimit = errorMessage.toLowerCase().includes('429') || errorMessage.toLowerCase().includes('quota');
+            const normalizedError = errorMessage.toLowerCase();
+            const isRateLimit = normalizedError.includes('429') || normalizedError.includes('quota');
+            const isTransientFailure =
+              isRateLimit ||
+              normalizedError.includes('timeout') ||
+              normalizedError.includes('network') ||
+              normalizedError.includes('failed to fetch') ||
+              normalizedError.includes('503') ||
+              normalizedError.includes('500');
             
-            if (isRateLimit) {
+            if (isTransientFailure) {
               retries++;
-              if (retries < 3) {
+              if (retries < 4) {
+                const waitSeconds = isRateLimit ? 5 * retries : 3 * retries;
                 setResumes(prev => {
                   const next = [...prev];
                   chunk.forEach(pr => {
-                    next[pr.originalIndex] = { ...next[pr.originalIndex], error: `Rate limited. Retrying in ${3 * retries}s...` };
+                    next[pr.originalIndex] = {
+                      ...next[pr.originalIndex],
+                      error: `${isRateLimit ? 'Rate limited' : 'Temporary API issue'}. Retrying in ${waitSeconds}s...`
+                    };
                   });
                   return next;
                 });
-                await sleep(3000 * retries);
+                await sleep(waitSeconds * 1000);
               } else {
                 setResumes(prev => {
                   const next = [...prev];
                   chunk.forEach(pr => {
-                    next[pr.originalIndex] = { ...next[pr.originalIndex], status: 'error', error: 'Rate limit exceeded. Try again later.' };
+                    next[pr.originalIndex] = {
+                      ...next[pr.originalIndex],
+                      status: 'error',
+                      error: isRateLimit ? 'Rate limit exceeded. Try again later.' : 'Temporary API issue. Please retry.'
+                    };
                   });
                   return next;
                 });
@@ -371,6 +437,8 @@ export default function App() {
 
     setIsProcessing(false);
   };
+
+  const hasCompletedAnalysis = resumes.some(r => r.status === 'success' || r.status === 'error');
 
   const exportCSV = () => {
     const processedResumes = resumes.filter(r => r.status === 'success' && r.result);
@@ -436,6 +504,27 @@ export default function App() {
       key,
       direction: prev.key === key && prev.direction === 'desc' ? 'asc' : 'desc'
     }));
+  };
+
+  const startEditingSessionName = () => {
+    setIsEditingSessionName(true);
+  };
+
+  const stopEditingSessionName = () => {
+    setSessionName(prev => prev.trim() || 'Untitled Session');
+    setIsEditingSessionName(false);
+  };
+
+  const handleSessionNameKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      stopEditingSessionName();
+    }
+
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      stopEditingSessionName();
+    }
   };
 
   if (view === 'dashboard') {
@@ -536,13 +625,30 @@ export default function App() {
               <div className="bg-blue-600 p-2 rounded-lg">
                 <BarChart3 className="w-5 h-5 text-white" />
               </div>
-              <input 
-                type="text"
-                value={sessionName}
-                onChange={(e) => setSessionName(e.target.value)}
-                className="text-xl font-semibold tracking-tight bg-transparent border-none focus:ring-0 p-0 hover:bg-slate-50 rounded px-2 outline-none"
-                placeholder="Session Name"
-              />
+              {isEditingSessionName ? (
+                <input
+                  ref={sessionNameInputRef}
+                  type="text"
+                  value={sessionName}
+                  onChange={(e) => setSessionName(e.target.value)}
+                  onBlur={stopEditingSessionName}
+                  onKeyDown={handleSessionNameKeyDown}
+                  className="min-w-[180px] text-xl font-semibold tracking-tight bg-slate-50 border border-slate-200 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 rounded-lg px-3 py-1.5 outline-none"
+                  placeholder="Session Name"
+                />
+              ) : (
+                <button
+                  type="button"
+                  onClick={startEditingSessionName}
+                  className="group inline-flex items-center gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-slate-50 transition-colors"
+                  title="Edit session name"
+                >
+                  <span className="text-xl font-semibold tracking-tight text-slate-900">
+                    {sessionName.trim() || 'Untitled Session'}
+                  </span>
+                  <Pencil className="w-4 h-4 text-slate-400 transition-colors group-hover:text-slate-600" />
+                </button>
+              )}
             </div>
           </div>
           <div className="flex items-center gap-3">
@@ -553,6 +659,14 @@ export default function App() {
             >
               <Download className="w-4 h-4" />
               Export CSV
+            </button>
+            <button 
+              onClick={() => handleAnalyze(true)}
+              disabled={isProcessing || !hasCompletedAnalysis || !jobDescription.trim() || resumes.some(r => r.status === 'parsing')}
+              className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+              Re-analyze All
             </button>
             <button 
               onClick={handleAnalyze}
@@ -783,6 +897,14 @@ function ResultRow({ resume, index, getScoreColor, getScoreTextColor, getRankBad
 }) {
   const [expanded, setExpanded] = useState(false);
   const hasResult = resume.status === 'success' && resume.result;
+  const contactDetails = resume.result?.contactDetails;
+  const hasContactDetails = Boolean(
+    contactDetails?.email ||
+    contactDetails?.phone ||
+    contactDetails?.linkedin ||
+    contactDetails?.github ||
+    contactDetails?.portfolio
+  );
 
   const getRecommendationBadge = (rec?: string) => {
     if (rec === 'Hire') return <span className="px-2.5 py-1 bg-green-100 text-green-700 rounded-full text-xs font-bold uppercase tracking-wider border border-green-200">Hire</span>;
@@ -854,22 +976,125 @@ function ResultRow({ resume, index, getScoreColor, getScoreTextColor, getRankBad
                   </div>
                 </div>
 
-                {/* Keywords Grid */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {/* Score Insights */}
+                <div className="bg-white p-4 rounded-lg border border-slate-200 shadow-sm">
+                  <h4 className="text-sm font-semibold text-slate-800 mb-3">Scoring Insights</h4>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                      <div className="text-xs uppercase tracking-wide text-slate-500">Required Skills</div>
+                      <div className="mt-1 text-lg font-semibold text-slate-800">{resume.result!.scoreBreakdown.requiredSkills}</div>
+                    </div>
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                      <div className="text-xs uppercase tracking-wide text-slate-500">Preferred Skills</div>
+                      <div className="mt-1 text-lg font-semibold text-slate-800">{resume.result!.scoreBreakdown.preferredSkills}</div>
+                    </div>
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                      <div className="text-xs uppercase tracking-wide text-slate-500">Role Fit</div>
+                      <div className="mt-1 text-lg font-semibold text-slate-800">{resume.result!.scoreBreakdown.roleFit}</div>
+                    </div>
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                      <div className="text-xs uppercase tracking-wide text-slate-500">Experience</div>
+                      <div className="mt-1 text-lg font-semibold text-slate-800">{resume.result!.scoreBreakdown.experience}</div>
+                    </div>
+                  </div>
+                  <div className="mt-3 text-sm text-slate-600">
+                    Estimated relevant experience: <span className="font-medium text-slate-800">{resume.result!.yearsExperience} year{resume.result!.yearsExperience === 1 ? '' : 's'}</span>
+                  </div>
+                </div>
+
+                {/* Contact Details */}
+                {hasContactDetails && (
+                  <div className="bg-white p-4 rounded-lg border border-slate-200 shadow-sm">
+                    <h4 className="text-sm font-semibold text-slate-800 mb-3">Contact Details</h4>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                      {contactDetails?.email && (
+                        <a
+                          href={`mailto:${contactDetails.email}`}
+                          className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-slate-700 hover:bg-slate-100 transition-colors"
+                        >
+                          <span className="block text-xs uppercase tracking-wide text-slate-500">Email</span>
+                          <span className="mt-1 block font-medium break-all">{contactDetails.email}</span>
+                        </a>
+                      )}
+                      {contactDetails?.phone && (
+                        <a
+                          href={`tel:${contactDetails.phone.replace(/\s+/g, '')}`}
+                          className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-slate-700 hover:bg-slate-100 transition-colors"
+                        >
+                          <span className="block text-xs uppercase tracking-wide text-slate-500">Phone</span>
+                          <span className="mt-1 block font-medium">{contactDetails.phone}</span>
+                        </a>
+                      )}
+                      {contactDetails?.linkedin && (
+                        <a
+                          href={contactDetails.linkedin}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-slate-700 hover:bg-slate-100 transition-colors"
+                        >
+                          <span className="block text-xs uppercase tracking-wide text-slate-500">LinkedIn</span>
+                          <span className="mt-1 block font-medium break-all">{contactDetails.linkedin}</span>
+                        </a>
+                      )}
+                      {contactDetails?.github && (
+                        <a
+                          href={contactDetails.github}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-slate-700 hover:bg-slate-100 transition-colors"
+                        >
+                          <span className="block text-xs uppercase tracking-wide text-slate-500">GitHub</span>
+                          <span className="mt-1 block font-medium break-all">{contactDetails.github}</span>
+                        </a>
+                      )}
+                      {contactDetails?.portfolio && (
+                        <a
+                          href={contactDetails.portfolio}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-slate-700 hover:bg-slate-100 transition-colors md:col-span-2"
+                        >
+                          <span className="block text-xs uppercase tracking-wide text-slate-500">Portfolio</span>
+                          <span className="mt-1 block font-medium break-all">{contactDetails.portfolio}</span>
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Match Breakdown */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                   <div>
                     <h4 className="text-sm font-semibold text-slate-800 mb-3 flex items-center gap-2">
                       <CheckCircle className="w-4 h-4 text-green-500" />
-                      Found Keywords
+                      Exact Match Skills
                     </h4>
                     <div className="flex flex-wrap gap-2">
-                      {resume.result!.foundKeywords.length > 0 ? (
-                        resume.result!.foundKeywords.map((kw, i) => (
+                      {resume.result!.exactMatchedSkills.length > 0 ? (
+                        resume.result!.exactMatchedSkills.map((kw, i) => (
                           <span key={i} className="px-2.5 py-1 bg-green-100 text-green-700 text-xs font-medium rounded-md border border-green-200">
                             {kw}
                           </span>
                         ))
                       ) : (
-                        <span className="text-sm text-slate-400">No matching keywords found.</span>
+                        <span className="text-sm text-slate-400">No exact skill matches found.</span>
+                      )}
+                    </div>
+                  </div>
+                  <div>
+                    <h4 className="text-sm font-semibold text-slate-800 mb-3 flex items-center gap-2">
+                      <CheckCircle className="w-4 h-4 text-amber-500" />
+                      Similar / Inferred Skills
+                    </h4>
+                    <div className="flex flex-wrap gap-2">
+                      {resume.result!.similarMatchedSkills.length > 0 ? (
+                        resume.result!.similarMatchedSkills.map((kw, i) => (
+                          <span key={i} className="px-2.5 py-1 bg-amber-100 text-amber-700 text-xs font-medium rounded-md border border-amber-200">
+                            {kw}
+                          </span>
+                        ))
+                      ) : (
+                        <span className="text-sm text-slate-400">No similar/project-inferred skills found.</span>
                       )}
                     </div>
                   </div>

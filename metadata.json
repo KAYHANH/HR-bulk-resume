@@ -1,5 +1,5 @@
 {
-  "name": "Bulk ATS Resume Checker",
+  "name": "Resume Checker for HR",
   "description": "Analyze and rank multiple resumes against a job description using Gemini AI.",
   "requestFramePermissions": []
 }
